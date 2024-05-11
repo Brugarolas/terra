@@ -2868,7 +2868,7 @@ function typecheck(topexp,luaenv,simultaneousdefinitions)
         if reciever:is "allocvar" then
             reciever = newobject(anchor,T.var,reciever.name,reciever.symbol):setlvalue(true):withtype(reciever.type)
         end
-        if reciever:is "var" then
+        if reciever:is "var" and reciever.type:isstruct() then
             local mt = reciever.type.metamethods
             if mt and mt.__init then
                 return checkmethodwithreciever(anchor, true, "__init", reciever, terralib.newlist(), "statement")
@@ -2878,7 +2878,7 @@ function typecheck(topexp,luaenv,simultaneousdefinitions)
 
     --check if metamethods.__move is implemented
     local function checkmove(anchor, reciever)
-        if reciever:is "var" then
+        if reciever:is "var" and reciever.type:isstruct() then
             --check if metamethod __move is implemented
             local mt = reciever.type.metamethods
             if mt and mt.__move then
@@ -2889,13 +2889,34 @@ function typecheck(topexp,luaenv,simultaneousdefinitions)
         return reciever
     end
 
+    --check if metamethods.__copy is implemented
+    local function checkcopies(anchor, rhs)
+        local function checkcopy(reciever)
+            if reciever:is "var" and reciever.type:isstruct() then
+                local mt = reciever.type.metamethods
+                if mt and mt.__copy then
+                    return checkmethodwithreciever(anchor, true, "__copy", reciever, terralib.newlist(), "statement")
+                end
+            end
+        end
+        --add all implemented copy-assignment methods
+        local stmts = terralib.newlist{}
+        for i,r in ipairs(rhs) do
+            local copy = checkcopy(r)
+            if copy then
+                stmts:insert(copy)
+            end
+        end
+        return stmts
+    end
+
     --check if metamethods.__dtor is implemented
     local function checkdtors(anchor, lhs)
         local function checkdtor(reciever)
             if reciever:is "allocvar" then
                 reciever = newobject(anchor,T.var,reciever.name,reciever.symbol):setlvalue(true):withtype(reciever.type)
             end
-            if reciever:is "var" then
+            if reciever:is "var" and reciever.type:isstruct() then
                 local mt = reciever.type.metamethods
                 if mt and mt.__dtor then
                     return checkmethodwithreciever(anchor, true, "__dtor", reciever, terralib.newlist(), "statement")
@@ -3371,8 +3392,12 @@ function typecheck(topexp,luaenv,simultaneousdefinitions)
                     local res = createassignment(s,lhs,rhs)
                     --destructor calls
                     local dtors = checkdtors(s, lhs)
+                    --copy-assignments calls, which enable side effects in the assignment
+                    local copies = checkcopies(s, rhs)
                     --returned statements:
-                    local stmts = terralib.newlist{ res }
+                    local stmts = terralib.newlist{}
+                    stmts:insertall(copies)
+                    stmts:insert(res)
                     --add deferred calls to the destructors
                     for i,dtor in ipairs(dtors) do
                         stmts:insert(newobject(s, T.defer, dtor))
@@ -3396,15 +3421,18 @@ function typecheck(topexp,luaenv,simultaneousdefinitions)
                 local rhs = checkexpressions(s.rhs)
                 local lhs = checkexpressions(s.lhs,"lexpression")
                 local res = createassignment(s,lhs,rhs)
-                --check for implemented destructor calls
+                --check for implemented destructor calls and copy-assignments
                 local dtors = checkdtors(s, lhs)
+                local copies = checkcopies(s, rhs)
                 --returned statements:
                 local stmts = terralib.newlist()
                 --(1) first apply destructor calls to free any heap memory of 'lhs' objects
                 stmts:insertall(dtors)
-                --(2) actual assignment
+                --(2) apply copy-constructor calls, which enable side effects in the assignment
+                stmts:insertall(copies)
+                --(3) actual assignment
                 stmts:insert(res)
-                --(3) add deferred calls to the destructors
+                --(4) add deferred calls to the destructors
                 for i,dtor in ipairs(dtors) do
                     stmts:insert(newobject(s, T.defer, dtor))
                 end
