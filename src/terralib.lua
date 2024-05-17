@@ -2878,6 +2878,77 @@ function typecheck(topexp,luaenv,simultaneousdefinitions)
         return anchor:aserror()
     end
 
+    --check if metamethods.__init is implemented
+    local function checkinit(anchor, reciever)
+        if reciever:is "allocvar" then
+            reciever = newobject(anchor,T.var,reciever.name,reciever.symbol):setlvalue(true):withtype(reciever.type)
+        end
+        if reciever:is "var" and reciever.type:isstruct() then
+            local mt = reciever.type.metamethods
+            if mt and mt.__init then
+                return checkmethodwithreciever(anchor, true, "__init", reciever, terralib.newlist(), "statement")
+            end
+        end
+    end
+
+    --check if metamethods.__move is implemented
+    local function checkmove(anchor, reciever)
+        if reciever:is "var" and reciever.type:isstruct() then
+            --check if metamethod __move is implemented
+            local mt = reciever.type.metamethods
+            if mt and mt.__move then
+                return checkmethodwithreciever(anchor, true, "__move", reciever, terralib.newlist(), "expression")
+            end
+        end
+        --if no metamethod __move is implemented or if not a 'var' just return
+        return reciever
+    end
+
+    --check if metamethods.__copy is implemented
+    local function checkcopies(anchor, rhs)
+        local function checkcopy(reciever)
+            if reciever:is "var" and reciever.type:isstruct() then
+                local mt = reciever.type.metamethods
+                if mt and mt.__copy then
+                    return checkmethodwithreciever(anchor, true, "__copy", reciever, terralib.newlist(), "statement")
+                end
+            end
+        end
+        --add all implemented copy-assignment methods
+        local stmts = terralib.newlist{}
+        for i,r in ipairs(rhs) do
+            local copy = checkcopy(r)
+            if copy then
+                stmts:insert(copy)
+            end
+        end
+        return stmts
+    end
+
+    --check if metamethods.__dtor is implemented
+    local function checkdtors(anchor, lhs)
+        local function checkdtor(reciever)
+            if reciever:is "allocvar" then
+                reciever = newobject(anchor,T.var,reciever.name,reciever.symbol):setlvalue(true):withtype(reciever.type)
+            end
+            if reciever:is "var" and reciever.type:isstruct() then
+                local mt = reciever.type.metamethods
+                if mt and mt.__dtor then
+                    return checkmethodwithreciever(anchor, true, "__dtor", reciever, terralib.newlist(), "statement")
+                end
+            end
+        end
+        --add all implemented destructor calls
+        local dtors = terralib.newlist{}
+        for i,e in ipairs(lhs) do
+            local dtor = checkdtor(e)
+            if dtor then
+                dtors:insert(dtor)
+            end
+        end
+        return dtors
+    end
+
     --functions that handle the checking of expressions
     local function checkluaexpression(e,location)
         local value = {}
@@ -3251,7 +3322,12 @@ function typecheck(topexp,luaenv,simultaneousdefinitions)
             if s:is "block" then
                 return checkblock(s)
             elseif s:is "returnstat" then
-                return s:copy { expression = checkexp(s.expression)}
+                local values = terralib.newlist{}
+                for i,e in ipairs(s.expression.expressions) do
+                    local v = checkexp(e)
+                    values:insert(checkmove(s,v))
+                end
+                return s:copy { expression = createlet(s, terralib.newlist(), values, false)}
             elseif s:is "label" or s:is "gotostat" then    
                 local ss = checklabel(s.label)
                 return copyobject(s, { label = ss })
@@ -3324,13 +3400,59 @@ function typecheck(topexp,luaenv,simultaneousdefinitions)
             elseif s:is "defvar" then
                 local rhs = s.hasinit and checkexpressions(s.initializers)
                 local lhs = checkformalparameterlist(s.variables, not s.hasinit)
-                local res = s.hasinit and createassignment(s,lhs,rhs) 
-                            or createstatementlist(s,lhs)
-                return res
+                --if there are initializers, create assignment and check if
+                --any destructors are implemented
+                if s.hasinit then
+                    --initializers
+                    local res = createassignment(s,lhs,rhs)
+                    --destructor calls
+                    local dtors = checkdtors(s, lhs)
+                    --copy-assignments calls, which enable side effects in the assignment
+                    local copies = checkcopies(s, rhs)
+                    --returned statements:
+                    local stmts = terralib.newlist{}
+                    stmts:insertall(copies)
+                    stmts:insert(res)
+                    --add deferred calls to the destructors
+                    for i,dtor in ipairs(dtors) do
+                        stmts:insert(newobject(s, T.defer, dtor))
+                    end
+                    return createstatementlist(s,stmts)
+                else
+                    --if no initializers, check for initializer metamethods and
+                    --return statement list and initializer statements
+                    local stmts = createstatementlist(s,lhs)
+                    --if there is no initializer then apply metamethods.__init if
+                    --defined and add expression to 'res'
+                    for i,e in ipairs(lhs) do
+                        local init = checkinit(s, e)
+                        if init then
+                            stmts.expressions:insert(init)
+                        end
+                    end
+                    return stmts
+                end
             elseif s:is "assignment" then
                 local rhs = checkexpressions(s.rhs)
                 local lhs = checkexpressions(s.lhs,"lexpression")
-                return createassignment(s,lhs,rhs)
+                local res = createassignment(s,lhs,rhs)
+                --check for implemented destructor calls and copy-assignments
+                local dtors = checkdtors(s, lhs)
+                local copies = checkcopies(s, rhs)
+                --returned statements:
+                local stmts = terralib.newlist()
+                --(1) first apply destructor calls to free any heap memory of 'lhs' objects
+                stmts:insertall(dtors)
+                --(2) apply copy-constructor calls, which enable side effects in the assignment
+                stmts:insertall(copies)
+                --(3) actual assignment
+                stmts:insert(res)
+                --(4) add deferred calls to the destructors
+                for i,dtor in ipairs(dtors) do
+                    stmts:insert(newobject(s, T.defer, dtor))
+                end
+                --return statements
+                return createstatementlist(s, stmts)
             elseif s:is "apply" then
                 return checkapply(s,"statement")
             elseif s:is "method" then
@@ -3546,11 +3668,11 @@ function terra.includecstring(code,cargs,target)
     	args:insert(path)
     end
     -- Obey the SDKROOT variable on macOS to match Clang behavior.
-    local sdkroot = os.getenv("SDKROOT")
-    if sdkroot then
-      args:insert("-isysroot")
-      args:insert(sdkroot)
-    end
+    --local sdkroot = os.getenv("SDKROOT")
+    --if sdkroot then
+    --  args:insert("-isysroot")
+    --  args:insert(sdkroot)
+    --end
     -- Set GNU C version to match value set by Clang: https://github.com/llvm/llvm-project/blob/f77c948d56b09b839262e258af5c6ad701e5b168/clang/lib/Driver/ToolChains/Clang.cpp#L5750-L5753
     if ffi.os ~= "Windows" and terralib.llvm_version >= 100 then
       args:insert("-fgnuc-version=4.2.1")
