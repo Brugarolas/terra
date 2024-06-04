@@ -596,9 +596,19 @@ static void constructor(LexState *ls) {
 static void structfield(LexState *ls) {
     Position p = getposition(ls);
     push_string(ls, str_checkname(ls));
+    int annotations = new_list(ls);
+    if (testnext(ls, '(')) {
+        if (!testnext(ls, ')')) {
+            do {
+                RETURNS_1(luaexpr(ls));
+                add_entry(ls, annotations);
+            } while (testnext(ls, ','));
+        }
+        check_match(ls, ')', '(', p.linenumber);
+    }
     checknext(ls, ':');
     RETURNS_1(terratype(ls));
-    new_object(ls, "structentry", 2, &p);
+    new_object(ls, "structentry", 3, &p);
 }
 
 static void structbody(LexState *ls) {
@@ -620,11 +630,16 @@ static void structconstructor(LexState *ls) {
     // already parsed 'struct' or 'struct' name.
     // starting at '{' or '('
     Position p = getposition(ls);
+    int metatypes = new_list(ls);
     if (testnext(ls, '(')) {
-        RETURNS_1(luaexpr(ls));
+        if (!testnext(ls, ')')) {
+            do {
+                RETURNS_1(luaexpr(ls));
+                add_entry(ls, metatypes);
+            } while (testnext(ls, ','));
+        }
         check_match(ls, ')', '(', p.linenumber);
-    } else
-        push_nil(ls);
+    }
     structbody(ls);
     new_object(ls, "structdef", 2, &p);
 }
