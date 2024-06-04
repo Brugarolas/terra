@@ -1,5 +1,6 @@
 /cmake-build-debug
 /build
+/cmake-build-debug
 /docs/_site
 /docs/_vendor
 /install
@@ -19,6 +20,11 @@
 /tests/dynlib
 /tests/dynlib.exe
 /tests/not_bc
+/tests/class2
+/tests/inline_c.exe
+/tests/objc
+/tests/objc2
+/tests/stdio.exe
 .idea/
 
 *.bc
